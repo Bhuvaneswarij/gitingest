@@ -1,0 +1,331 @@
+import os
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import yfinance as yf
+import pmdarima as pm
+from prophet import Prophet
+from tqdm.auto import tqdm
+
+# Set random seeds for reproducibility
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# %% [markdown]
+# 1) Download dataset (example: AAPL stock prices, using Open, High, Low, Close, Volume)
+# You can change the ticker and period as needed.
+
+# %%
+TICKER = 'AAPL'
+START = '2015-01-01'
+END = '2024-12-31'
+
+df = yf.download(TICKER, start=START, end=END, progress=False)
+print(f"Downloaded {len(df)} rows for {TICKER}")
+
+# Basic inspection
+print(df.head())
+
+# %% [markdown]
+# 2) Preprocessing and feature engineering
+
+# %%
+# Use Close as target and include Volume + returns as covariates
+data = df[['Open','High','Low','Close','Volume']].copy()
+# Create log returns
+data['ret_1'] = data['Close'].pct_change().fillna(0)
+# Rolling features
+data['rmean_7'] = data['Close'].rolling(7).mean().fillna(method='bfill')
+data['rstd_7']  = data['Close'].rolling(7).std().fillna(method='bfill')
+# Time features
+data['dayofweek'] = data.index.dayofweek
+data['month'] = data.index.month
+
+# Forward fill any remaining NaNs
+data = data.fillna(method='ffill').dropna()
+
+TARGET = 'Close'
+FEATURES = [c for c in data.columns if c != TARGET]
+print('Features:', FEATURES)
+
+# %% [markdown]
+# 3) Train/Validation/Test split (time-based)
+
+# %%
+n = len(data)
+train_end = int(n * 0.7)
+val_end = int(n * 0.85)
+
+train_df = data.iloc[:train_end]
+val_df = data.iloc[train_end:val_end]
+test_df = data.iloc[val_end:]
+
+print(len(train_df), len(val_df), len(test_df))
+
+# %% [markdown]
+# 4) Scaling
+
+# %%
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+scaler_X.fit(train_df[FEATURES])
+scaler_y.fit(train_df[[TARGET]])
+
+X_train = scaler_X.transform(train_df[FEATURES])
+X_val = scaler_X.transform(val_df[FEATURES])
+X_test = scaler_X.transform(test_df[FEATURES])
+
+y_train = scaler_y.transform(train_df[[TARGET]]).flatten()
+y_val = scaler_y.transform(val_df[[TARGET]]).flatten()
+y_test = scaler_y.transform(test_df[[TARGET]]).flatten()
+
+# %% [markdown]
+# 5) Create sequences for supervised learning
+
+# %%
+LOOKBACK = 60  # how many past timesteps to use
+HORIZON = 1    # forecast horizon (1-step ahead); can expand to multi-step
+
+def create_sequences(X, y, lookback=LOOKBACK, horizon=HORIZON):
+    Xs, ys = [], []
+    for i in range(lookback, len(X)-horizon+1):
+        Xs.append(X[i-lookback:i])
+        ys.append(y[i + horizon - 1])
+    return np.array(Xs), np.array(ys)
+
+Xtr, ytr = create_sequences(X_train, y_train)
+Xv, yv = create_sequences(X_val, y_val)
+Xt, yt = create_sequences(X_test, y_test)
+
+print('Shapes:', Xtr.shape, ytr.shape, Xv.shape, yv.shape, Xt.shape, yt.shape)
+
+# %% [markdown]
+# 6) Build Quantile Regression LSTM
+
+# Quantile loss
+import tensorflow.keras.backend as K
+
+def quantile_loss(q, y, f):
+    e = y - f
+    return K.mean(K.maximum(q * e, (q - 1) * e), axis=-1)
+
+# Build model factory
+
+def build_lstm_quantile(input_shape, quantiles=[0.1,0.5,0.9], units=64, dropout_rate=0.2):
+    inp = keras.Input(shape=input_shape)
+    x = layers.LSTM(units, return_sequences=True)(inp)
+    x = layers.Dropout(dropout_rate)(x)
+    x = layers.LSTM(units//2)(x)
+    x = layers.Dropout(dropout_rate)(x)
+    outputs = []
+    for q in quantiles:
+        out = layers.Dense(1, name=f'q_{int(q*100)}')(x)
+        outputs.append(out)
+    model = keras.Model(inp, outputs)
+    return model
+
+quantiles = [0.1, 0.5, 0.9]
+model_q = build_lstm_quantile(Xtr.shape[1:], quantiles=quantiles, units=64, dropout_rate=0.2)
+
+# Compile with custom loss dictionary
+losses = {f'q_{int(q*100)}': (lambda q: (lambda y,f: quantile_loss(q,y,f)))(q) for q in quantiles}
+model_q.compile(optimizer='adam', loss=losses)
+model_q.summary()
+
+# %% [markdown]
+# 7) Train Quantile model
+
+# Prepare targets as dict
+train_targets = {f'q_{int(q*100)}': ytr for q in quantiles}
+val_targets = {f'q_{int(q*100)}': yv for q in quantiles}
+
+EPOCHS = 30
+BATCH = 32
+
+history = model_q.fit(Xtr, train_targets, validation_data=(Xv, val_targets), epochs=EPOCHS, batch_size=BATCH)
+
+# %% [markdown]
+# 8) Predict and compute intervals
+
+# Predict (returns list of arrays in order of outputs)
+preds = model_q.predict(Xt)
+# preds is list len=3 each shape (n_samples,1)
+q_preds = np.hstack(preds)  # shape (n_samples, 3)
+
+# Inverse transform the scaled predictions and targets
+q_preds_inv = scaler_y.inverse_transform(q_preds)
+yt_inv = scaler_y.inverse_transform(yt.reshape(-1,1)).flatten()
+
+# Build dataframe for evaluation
+pred_df = pd.DataFrame({
+    'y_true': yt_inv,
+    'q_10': q_preds_inv[:,0],
+    'q_50': q_preds_inv[:,1],
+    'q_90': q_preds_inv[:,2],
+})
+
+# Metrics for point forecast (median)
+rmse_q = math.sqrt(mean_squared_error(pred_df['y_true'], pred_df['q_50']))
+mae_q = mean_absolute_error(pred_df['y_true'], pred_df['q_50'])
+print('Quantile-LSTM (median) RMSE:', rmse_q, 'MAE:', mae_q)
+
+# Coverage: fraction of true values inside [q10, q90]
+coverage = ((pred_df['y_true'] >= pred_df['q_10']) & (pred_df['y_true'] <= pred_df['q_90'])).mean()
+print('Empirical coverage (10-90):', coverage)
+
+# %% [markdown]
+# 9) Plot results
+
+# %%
+plt.figure(figsize=(12,5))
+plt.plot(pred_df['y_true'][-200:], label='True')
+plt.plot(pred_df['q_50'][-200:], label='Median Forecast')
+plt.fill_between(pred_df.index[-200:], pred_df['q_10'][-200:], pred_df['q_90'][-200:], alpha=0.3, label='10-90 PI')
+plt.legend()
+plt.title('Quantile-LSTM Forecast (test subset)')
+plt.show()
+
+# %% [markdown]
+# 10) LSTM with Monte Carlo Dropout
+# We'll define a model with Dropout and keep it active at inference time by using learning_phase or Dropout layers with `training=True` during predict.
+
+# %%
+from tensorflow.keras.layers import Dropout
+
+def build_lstm_mc(input_shape, units=64, dropout_rate=0.2):
+    inp = keras.Input(shape=input_shape)
+    x = layers.LSTM(units, return_sequences=True)(inp)
+    x = layers.Dropout(dropout_rate)(x)
+    x = layers.LSTM(units//2)(x)
+    x = layers.Dropout(dropout_rate)(x)
+    out = layers.Dense(1)(x)
+    model = keras.Model(inp, out)
+    return model
+
+model_mc = build_lstm_mc(Xtr.shape[1:], units=64, dropout_rate=0.2)
+model_mc.compile(optimizer='adam', loss='mse')
+model_mc.summary()
+
+# Train
+history_mc = model_mc.fit(Xtr, ytr, validation_data=(Xv, yv), epochs=EPOCHS, batch_size=BATCH)
+
+# Monte Carlo sampling function
+import numpy as np
+
+def mc_dropout_predict(model, X, n_samples=100):
+    # Run predictions with dropout active
+    f_preds = []
+    for i in range(n_samples):
+        preds_i = model(X, training=True).numpy().flatten()
+        f_preds.append(preds_i)
+    f_preds = np.array(f_preds)  # shape (n_samples, n_points)
+    mean_pred = f_preds.mean(axis=0)
+    std_pred = f_preds.std(axis=0)
+    return mean_pred, std_pred, f_preds
+
+mc_mean_scaled, mc_std_scaled, mc_all = mc_dropout_predict(model_mc, Xt, n_samples=100)
+mc_mean = scaler_y.inverse_transform(mc_mean_scaled.reshape(-1,1)).flatten()
+mc_std = mc_std_scaled * scaler_y.scale_[0]  # scale std by scaler
+
+# 95% interval
+mc_lower = mc_mean - 1.96 * mc_std
+mc_upper = mc_mean + 1.96 * mc_std
+
+# Evaluate
+rmse_mc = math.sqrt(mean_squared_error(yt_inv, mc_mean))
+mae_mc = mean_absolute_error(yt_inv, mc_mean)
+coverage_mc = ((yt_inv >= mc_lower) & (yt_inv <= mc_upper)).mean()
+print('MC Dropout RMSE:', rmse_mc, 'MAE:', mae_mc, 'Coverage (95%):', coverage_mc)
+
+# Plot subset
+plt.figure(figsize=(12,5))
+plt.plot(yt_inv[-200:], label='True')
+plt.plot(mc_mean[-200:], label='MC Mean')
+plt.fill_between(range(len(mc_mean[-200:])), mc_lower[-200:], mc_upper[-200:], alpha=0.2, label='MC 95% PI')
+plt.legend()
+plt.title('LSTM + MC Dropout Forecast (test subset)')
+plt.show()
+
+# %% [markdown]
+# 11) Baseline: ARIMA (pmdarima auto_arima) on the Close series (univariate)
+
+# %%
+close_series = data[TARGET]
+train_close = close_series.iloc[:train_end]
+val_close = close_series.iloc[train_end:val_end]
+test_close = close_series.iloc[val_end:]
+
+# Fit auto_arima on train
+arima = pm.auto_arima(train_close, seasonal=False, stepwise=True, suppress_warnings=True, error_action='ignore')
+print('ARIMA order:', arima.order)
+
+# Forecast on test horizon (one-step rolling forecast for fairness)
+history_arima = list(train_close)
+preds_arima = []
+for t in range(len(test_close)):
+    model = pm.ARIMA(order=arima.order).fit(np.array(history_arima))
+    yhat = model.predict(n_periods=1)[0]
+    preds_arima.append(yhat)
+    history_arima.append(test_close.iloc[t])
+
+rmse_arima = math.sqrt(mean_squared_error(test_close.values, preds_arima))
+mae_arima = mean_absolute_error(test_close.values, preds_arima)
+print('ARIMA RMSE:', rmse_arima, 'MAE:', mae_arima)
+
+# %% [markdown]
+# 12) Baseline: Prophet (optional) — requires 'ds' and 'y' columns
+
+# %%
+prophet_df = pd.DataFrame({'ds': close_series.index, 'y': close_series.values})
+train_prophet = prophet_df.iloc[:train_end]
+model_prophet = Prophet()
+model_prophet.fit(train_prophet)
+
+future = model_prophet.make_future_dataframe(periods=len(test_close), freq='D')
+forecast_prophet = model_prophet.predict(future)
+# extract test-period forecasts
+fc_prophet = forecast_prophet[['ds','yhat']].set_index('ds').loc[test_close.index]['yhat'].values
+
+rmse_prophet = math.sqrt(mean_squared_error(test_close.values, fc_prophet))
+mae_prophet = mean_absolute_error(test_close.values, fc_prophet)
+print('Prophet RMSE:', rmse_prophet, 'MAE:', mae_prophet)
+
+# %% [markdown]
+# 13) Collect results and compare
+
+# %%
+results = pd.DataFrame({
+    'model': ['Quantile-LSTM (median)', 'LSTM MC Dropout (mean)', 'ARIMA', 'Prophet'],
+    'RMSE': [rmse_q, rmse_mc, rmse_arima, rmse_prophet],
+    'MAE': [mae_q, mae_mc, mae_arima, mae_prophet]
+})
+print(results)
+
+# %% [markdown]
+# 14) Save models and artifacts
+
+# %%
+os.makedirs('models', exist_ok=True)
+model_q.save('models/quantile_lstm')
+model_mc.save('models/lstm_mc')
+
+# Save scalers
+import joblib
+joblib.dump(scaler_X, 'models/scaler_X.pkl')
+joblib.dump(scaler_y, 'models/scaler_y.pkl')
+
+# %% [markdown]
+# 15) Notes & next steps
+# - For probabilistic scoring you can compute CRPS (requires properscoring package).
+# - For multistep forecasts extend horizon and adapt sequence creation accordingly.
+# - To speed up training use GPU and reduce EPOCHS for quick debugging.
+
+print('Script finished. Review plots and results.')
